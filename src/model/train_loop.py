@@ -10,7 +10,6 @@ import numpy as np
 import tiktoken
 from gpt2 import GPT, GPTConfig, get_most_likely_row
 
-# DDP setup
 ddp = int(os.environ.get('RANK', -1)) != -1 
 if ddp:
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
@@ -33,12 +32,10 @@ else:
 
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-# Seeds
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
-# Custom DataLoader for .npy file
 class DataLoaderNPY:
     def __init__(self, npy_file, B, T, process_rank, num_processes, train_split=0.9):
         self.B = B
@@ -48,7 +45,6 @@ class DataLoaderNPY:
         
         self.tokens = np.load(npy_file).astype(np.int32)
         
-        # Split into train and val
         split_idx = int(len(self.tokens) * train_split)
         self.train_tokens = self.tokens[:split_idx]
         self.val_tokens = self.tokens[split_idx:]
@@ -67,9 +63,7 @@ class DataLoaderNPY:
     def next_batch(self):
         B, T = self.B, self.T
         
-        # Check if we have enough tokens in current dataset
         if len(self.current_tokens) < B * T + 1:
-            # If dataset is too small, reduce batch size
             effective_B = max(1, len(self.current_tokens) // (T + 1))
             buf = self.current_tokens[:effective_B * T + 1]
             x = torch.from_numpy(buf[:-1]).view(effective_B, T).long()
@@ -78,16 +72,13 @@ class DataLoaderNPY:
         
         buf = self.current_tokens[self.current_position : self.current_position + B*T + 1]
         
-        # If we don't have enough tokens, wrap around
         if len(buf) < B*T + 1:
-            # Wrap around to beginning
             needed = (B*T + 1) - len(buf)
             buf = np.concatenate([buf, self.current_tokens[:needed]])
             self.current_position = needed
         else:
             self.current_position += B*T * self.num_processes
         
-        # If position exceeds length, wrap around
         if self.current_position + (B*T + 1) > len(self.current_tokens):
             self.current_position = self.B * self.T * self.process_rank
         
@@ -95,7 +86,6 @@ class DataLoaderNPY:
         y = torch.from_numpy(buf[1:]).view(B, T).long()
         return x, y
 
-# Configuration
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288
@@ -104,7 +94,6 @@ T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 
-# Create data loaders
 data_loader = DataLoaderNPY(
     npy_file="./src/model/greentext_data/greentext.npy",
     B=B, 
@@ -115,7 +104,6 @@ data_loader = DataLoaderNPY(
 
 torch.set_float32_matmul_precision('high')
 
-# Model setup
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 use_compile = False
@@ -125,7 +113,6 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
 
-# Learning rate schedule
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
@@ -143,7 +130,6 @@ def get_lr(it):
 
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-# Logging setup
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
@@ -155,7 +141,6 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    # Validation
     if step % 250 == 0 or last_step:
         model.eval()
         data_loader.set_split("val")
@@ -198,7 +183,6 @@ for step in range(max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
     
-    # Training
     model.train()
     data_loader.set_split("train")
     optimizer.zero_grad()
