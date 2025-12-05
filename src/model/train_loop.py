@@ -1,23 +1,24 @@
-import torch
-import torch.nn.functional as F
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
+import math
 import os
 import time
-import math
+
 import numpy as np
 import tiktoken
-from gpt2 import GPT, GPTConfig, get_most_likely_row
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from gpt2 import GPT, GPTConfig
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-ddp = int(os.environ.get('RANK', -1)) != -1 
+ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
 else:
     ddp_rank = 0
@@ -36,75 +37,83 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
+
 class DataLoaderNPY:
     def __init__(self, npy_file, B, T, process_rank, num_processes, train_split=0.9):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
-        
+
         self.tokens = np.load(npy_file).astype(np.int32)
-        
+
         split_idx = int(len(self.tokens) * train_split)
         self.train_tokens = self.tokens[:split_idx]
         self.val_tokens = self.tokens[split_idx:]
-        
-        
+
         self.current_tokens = self.train_tokens
         self.current_position = self.B * self.T * self.process_rank
-        
+
     def set_split(self, split):
         self.current_tokens = self.train_tokens if split == "train" else self.val_tokens
         self.current_position = self.B * self.T * self.process_rank
-    
+
     def reset(self):
         self.current_position = self.B * self.T * self.process_rank
-    
+
     def next_batch(self):
         B, T = self.B, self.T
-        
+
         if len(self.current_tokens) < B * T + 1:
             effective_B = max(1, len(self.current_tokens) // (T + 1))
-            buf = self.current_tokens[:effective_B * T + 1]
+            buf = self.current_tokens[: effective_B * T + 1]
             x = torch.from_numpy(buf[:-1]).view(effective_B, T).long()
             y = torch.from_numpy(buf[1:]).view(effective_B, T).long()
             return x, y
-        
-        buf = self.current_tokens[self.current_position : self.current_position + B*T + 1]
-        
-        if len(buf) < B*T + 1:
-            needed = (B*T + 1) - len(buf)
+
+        buf = self.current_tokens[
+            self.current_position : self.current_position + B * T + 1
+        ]
+
+        if len(buf) < B * T + 1:
+            needed = (B * T + 1) - len(buf)
             buf = np.concatenate([buf, self.current_tokens[:needed]])
             self.current_position = needed
         else:
-            self.current_position += B*T * self.num_processes
-        
-        if self.current_position + (B*T + 1) > len(self.current_tokens):
+            self.current_position += B * T * self.num_processes
+
+        if self.current_position + (B * T + 1) > len(self.current_tokens):
             self.current_position = self.B * self.T * self.process_rank
-        
+
         x = torch.from_numpy(buf[:-1]).view(B, T).long()
         y = torch.from_numpy(buf[1:]).view(B, T).long()
         return x, y
 
+
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288
-B = 64 
-T = 1024 
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+B = 64
+T = 256
+assert total_batch_size % (B * T * ddp_world_size) == 0, (
+    "make sure total_batch_size is divisible by B * T * ddp_world_size"
+)
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 
 data_loader = DataLoaderNPY(
     npy_file="./src/model/greentext_data/greentext.npy",
-    B=B, 
-    T=T, 
-    process_rank=ddp_rank, 
-    num_processes=ddp_world_size
+    B=B,
+    T=T,
+    process_rank=ddp_rank,
+    num_processes=ddp_world_size,
 )
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(
+    GPTConfig(block_size=256, vocab_size=50304, n_layer=4, n_head=4, n_embd=256)
+)
+
 model.to(device)
 use_compile = False
 if use_compile:
@@ -118,28 +127,32 @@ min_lr = max_lr * 0.1
 warmup_steps = 715
 max_steps = 19073
 
+
 def get_lr(it):
     if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
+        return max_lr * (it + 1) / warmup_steps
     if it > max_steps:
         return min_lr
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+optimizer = raw_model.configure_optimizers(
+    weight_decay=0.1, learning_rate=6e-4, device_type=device_type
+)
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: 
+log_file = os.path.join(log_dir, "log.txt")
+with open(log_file, "w") as f:
     pass
 
 # Training loop
 for step in range(max_steps):
     t0 = time.time()
-    last_step = (step == max_steps - 1)
+    last_step = step == max_steps - 1
 
     if step % 250 == 0 or last_step:
         model.eval()
@@ -171,18 +184,18 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) 
-                logits = logits[:, -1, :] 
+                    logits, loss = model(xgen)
+                logits = logits[:, -1, :]
                 probs = F.softmax(logits, dim=-1)
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
-                xcol = torch.gather(topk_indices, -1, ix) 
+                xcol = torch.gather(topk_indices, -1, ix)
                 xgen = torch.cat((xgen, xcol), dim=1)
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
-    
+
     model.train()
     data_loader.set_split("train")
     optimizer.zero_grad()
@@ -191,7 +204,7 @@ for step in range(max_steps):
         x, y = data_loader.next_batch()
         x, y = x.to(device), y.to(device)
         if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
@@ -202,14 +215,14 @@ for step in range(max_steps):
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group["lr"] = lr
     optimizer.step()
     if device_type == "cuda":
-        torch.cuda.synchronize() 
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     tokens_processed = data_loader.B * data_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-   
+
 if ddp:
     destroy_process_group()
