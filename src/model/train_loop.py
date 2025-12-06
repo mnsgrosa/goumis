@@ -224,5 +224,7 @@ for step in range(max_steps):
     tokens_processed = data_loader.B * data_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
 
+model.save(model.state_dict(), "./weights")
+
 if ddp:
     destroy_process_group()

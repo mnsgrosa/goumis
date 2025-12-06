@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 
+import shap
 import torch
 import torch.nn as nn
 from hellaswag import iterate_examples, render_example
